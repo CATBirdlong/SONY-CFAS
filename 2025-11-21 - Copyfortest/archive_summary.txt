@@ -1,0 +1,12 @@
+﻿------------------------------------------------------------------------------
+Archive summary for: D:\Pictures\PhotosPics-ofCBLnSONY\SONY_Alpha\arcv-e10m2\2025-11-21 - Copyfortest
+Start : 02/06/2026 10:09:19
+End   : 02/06/2026 10:09:21
+Elapsed: 00:00:01.6983184
+Moved : 24
+Skipped(conflicts): 0
+Failed: 0
+Bytes moved: 721170208
+Speed (bytes/sec): 424637811
+SessionId: a12bd7df-4d52-4014-bc46-99380064ccc8
+------------------------------------------------------------------------------
