@@ -27,6 +27,9 @@ param(
         [switch]$SkipMain
 )
 
+# Ensure ScriptPath is set even when script is invoked in unusual host contexts
+if (-not $ScriptPath) { try { $ScriptPath = $PSScriptRoot } catch {}; if (-not $ScriptPath) { $ScriptPath = (Get-Location).ProviderPath } }
+
 # --------- logging ----------
 function Init-LatestLog {
     param([string]$BasePath)
@@ -38,9 +41,26 @@ function Init-LatestLog {
 function Write-Log {
     param([string]$BasePath,[string]$Level="INFO",[string]$Message)
     try {
-        $logPath = Join-Path $BasePath "latest.log"
+        # Defensive: ensure we have a usable directory to write logs
+        if ([string]::IsNullOrWhiteSpace($BasePath)) { return }
+        $dir = $null
+        try {
+            # If BasePath is a file path, get parent directory; if it's a directory, use it
+            if ($BasePath -and (Test-Path -LiteralPath $BasePath -PathType Container)) { $dir = (Get-Item -LiteralPath $BasePath).FullName }
+            elseif ($BasePath -and (Test-Path -LiteralPath $BasePath -PathType Leaf)) { $dir = Split-Path $BasePath -Parent }
+            else {
+                # attempt to resolve; fall back to parent if looks like a file
+                try { if ($BasePath) { $rp = Resolve-Path -LiteralPath $BasePath -ErrorAction SilentlyContinue; if ($rp) { $dir = $rp.ProviderPath } } } catch {}
+                if (-not $dir) { $dir = Split-Path $BasePath -Parent }
+            }
+        } catch { $dir = $null }
+        if (-not $dir) { try { $dir = (Get-Location).ProviderPath } catch { return } }
+        # Ensure directory exists (guard against null)
+        if ([string]::IsNullOrWhiteSpace($dir)) { return }
+        try { if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null } } catch {}
+        $logPath = Join-Path $dir "latest.log"
         $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-        Add-Content -Path $logPath -Value "[$ts] ${Level}: $Message"
+        try { Add-Content -Path $logPath -Value "[$ts] ${Level}: $Message" -ErrorAction Stop } catch { Write-Host "LOGGING ERROR (write failed): $($_.Exception.Message)" }
     } catch {
         Write-Host "LOGGING ERROR: $($_.Exception.Message)"
     }
@@ -361,9 +381,24 @@ function Show-ArchiveModes {
     }
 }
 
+# GLOBAL: Prompt user to continue to sync or end; returns TRUE to continue
+# Must be at script scope not nested so it can be called from anywhere in script
+function Prompt-ContinueToSync {
+    param([string]$PromptMessage = "Press 'C' then Enter to continue to sync, or press Enter to end")
+    try {
+        $resp = $null
+        try { $resp = Read-Host $PromptMessage } catch { $resp = '' }
+        if ([string]::IsNullOrEmpty($resp) -or [string]::IsNullOrWhiteSpace($resp)) { return $false }
+        $c = $resp.Trim()
+        return ($c.Length -eq 1 -and $c[0] -match '[Cc]')
+    } catch {
+        return $false
+    }
+}
+
 # Auto archive: scan date folder and move files to parent-level archive folders
 function Invoke-AutoArchive {
-    param([string]$DateFolder, [int]$ListLimit = 100, [ValidateSet('new','old')][string]$ArchiveMode = 'new')
+    param([string]$DateFolder, [int]$ListLimit = 100, [ValidateSet('new','old')][string]$ArchiveMode = 'new', [bool]$PromptForSync = $true)
 
     if (-not (Test-Path -LiteralPath $DateFolder)) { return $true }
     # Use the date folder itself as the archive root to avoid moving files to the parent-level folders
@@ -411,19 +446,6 @@ function Invoke-AutoArchive {
         '7' { $toMove = @() }
         default { Write-Host "No archive action selected."; $toMove = @() }
     }
-
-    # Helper: prompt user to continue to sync or end; returns $true to continue
-function Prompt-ContinueToSync {
-    param([string]$PromptMessage = "Press 'C' then Enter to continue to sync, or press Enter to end")
-    try {
-        $resp = $null
-        try { $resp = Read-Host $PromptMessage } catch { $resp = '' }
-        if ([string]::IsNullOrWhiteSpace($resp)) { return $false }
-        return ($resp -ieq 'C')
-    } catch {
-        return $false
-    }
-}
 
 # If nothing to move, ask user whether to continue to the sync module or end
     if (-not $toMove -or $toMove.Count -eq 0) {
@@ -518,7 +540,237 @@ function Prompt-ContinueToSync {
     $summary | Out-File -FilePath $summaryPath -Encoding UTF8
     $summary | ForEach-Object { Write-Host $_ }
 
-    return Prompt-ContinueToSync -PromptMessage "Enter 'C' then Enter to continue to sync, or press Enter to end"
+    if ($PromptForSync) {
+        return Prompt-ContinueToSync -PromptMessage "Enter 'C' then Enter to continue to sync, or press Enter to end"
+    } else {
+        return $false  # In multi-folder mode, don't continue to sync yet
+    }
+}
+
+# Aggregate archive candidates across multiple date folders in a single scan
+# CRITICAL: Store file objects WITH their classification to avoid re-classification errors
+function Aggregate-ArchiveCandidates {
+    param(
+        [Parameter(Mandatory=$true)][System.IO.DirectoryInfo[]]$Folders,
+        [int]$Sample = 50
+    )
+    $mediaExt = @('mp4','mov','mkv')
+    $rawExt   = @('arw')
+    $soHifExt = @('hif','heic')
+    $soJpgExt = @('jpg','jpeg')
+
+    $agg = @()
+    foreach ($df in $Folders) {
+        $allFiles = Get-ChildItem -LiteralPath $df.FullName -File -ErrorAction SilentlyContinue
+        $medias = @($allFiles | Where-Object { $mediaExt -contains ($_.Extension.TrimStart('.').ToLower()) })
+        $raws   = @($allFiles | Where-Object { $rawExt -contains ($_.Extension.TrimStart('.').ToLower()) })
+        $soHif  = @($allFiles | Where-Object { $soHifExt -contains ($_.Extension.TrimStart('.').ToLower()) })
+        $soJpg  = @($allFiles | Where-Object { $soJpgExt -contains ($_.Extension.TrimStart('.').ToLower()) })
+
+        $agg += [PSCustomObject]@{
+            Folder = $df
+            Medias = $medias
+            Raws   = $raws
+            SoHif  = $soHif
+            SoJpg  = $soJpg
+            # CRITICAL: also store classified file mappings for accurate routing in batch executor
+            FileClassifications = @{
+                Medias = $medias | ForEach-Object { $_.FullName }
+                Raws   = $raws   | ForEach-Object { $_.FullName }
+                SoHif  = $soHif  | ForEach-Object { $_.FullName }
+                SoJpg  = $soJpg  | ForEach-Object { $_.FullName }
+            }
+        }
+    }
+    return $agg
+}
+
+# Show aggregated summary using ASCII-friendly formatting (no clearing)
+function Show-AggregatedSummary {
+    param([Parameter(Mandatory=$true)]$Agg, [int]$Sample = 50)
+    Write-Host "================================================================================"
+    $folderNames = $Agg | ForEach-Object { $_.Folder.Name }
+    Write-Host ("Archive candidates summary (" + ($folderNames -join ',') + ") :")
+    Write-Host "--------------------------------------------------------------------------------"
+    foreach ($entry in $Agg) {
+        $name = $entry.Folder.Name
+        Write-Host "-> $name"
+        Write-Host "  Medias: $($entry.Medias.Count)"
+        $entry.Medias | Select-Object -First $Sample | ForEach-Object { Write-Host "    $_.Name" }
+        if ($entry.Medias.Count -gt $Sample) { Write-Host "    ... and $($entry.Medias.Count - $Sample) more" }
+
+        Write-Host "  RAW: $($entry.Raws.Count)"
+        $entry.Raws | Select-Object -First $Sample | ForEach-Object { Write-Host "    $_.Name" }
+        if ($entry.Raws.Count -gt $Sample) { Write-Host "    ... and $($entry.Raws.Count - $Sample) more" }
+
+        Write-Host "  HIF: $($entry.SoHif.Count)  JPG: $($entry.SoJpg.Count)"
+        $entry.SoHif | Select-Object -First $Sample | ForEach-Object { Write-Host "    HIF: $_.Name" }
+        $entry.SoJpg | Select-Object -First $Sample | ForEach-Object { Write-Host "    JPG: $_.Name" }
+        if (($entry.SoHif.Count + $entry.SoJpg.Count) -gt $Sample) { Write-Host "    ... and $((($entry.SoHif.Count + $entry.SoJpg.Count) - $Sample)) more" }
+        Write-Host "--------------------------------------------------------------------------------"
+    }
+    $totMed = ($Agg | ForEach-Object { $_.Medias.Count } | Measure-Object -Sum).Sum
+    $totRaw = ($Agg | ForEach-Object { $_.Raws.Count } | Measure-Object -Sum).Sum
+    $totHif = ($Agg | ForEach-Object { $_.SoHif.Count } | Measure-Object -Sum).Sum
+    $totJpg = ($Agg | ForEach-Object { $_.SoJpg.Count } | Measure-Object -Sum).Sum
+    Write-Host "Total counts: Medias=$totMed, RAW=$totRaw, HIF=$totHif, JPG=$totJpg"
+    Write-Host "================================================================================"
+}
+
+# Perform batch archive using pre-collected file lists (dry-run by default)
+# CRITICAL FIX: Process each file type SEPARATELY to maintain classification integrity
+function Batch-PerformArchive {
+    param(
+        [Parameter(Mandatory=$true)]$Agg,
+        [Parameter(Mandatory=$true)][int]$Option,
+        [ValidateSet('new','old')][string]$ArchiveMode = 'new',
+        [switch]$Apply
+    )
+    if (-not $Agg -or $Agg.Count -eq 0) {
+        Write-Host "ERROR: No folders to archive." -ForegroundColor Red
+        return
+    }
+    
+    foreach ($entry in $Agg) {
+        $archiveRoot = $entry.Folder.FullName
+        if (-not (Test-Path -LiteralPath $archiveRoot -PathType Container)) {
+            Write-Host "ERROR: Archive folder does not exist: $archiveRoot" -ForegroundColor Red
+            continue
+        }
+        
+        $medias = $entry.Medias
+        $raws   = $entry.Raws
+        $soHif  = $entry.SoHif
+        $soJpg  = $entry.SoJpg
+
+        # Determine what to move based on option - keep types SEPARATED
+        $toMoveMedias = @()
+        $toMoveRaws   = @()
+        $toMoveSoHif  = @()
+        $toMoveSoJpg  = @()
+        
+        switch ([int]$Option) {
+            1 { $toMoveMedias = $medias; $toMoveRaws = $raws; $toMoveSoHif = $soHif; $toMoveSoJpg = $soJpg }
+            2 { $toMoveMedias = $medias }
+            3 { $toMoveRaws = $raws }
+            4 { $toMoveSoHif = $soHif; $toMoveSoJpg = $soJpg }
+            5 { $toMoveMedias = $medias; $toMoveRaws = $raws }
+            6 { $toMoveRaws = $raws; $toMoveSoHif = $soHif; $toMoveSoJpg = $soJpg }
+        }
+
+        $totalToMove = $toMoveMedias.Count + $toMoveRaws.Count + $toMoveSoHif.Count + $toMoveSoJpg.Count
+        if ($totalToMove -eq 0) {
+            Write-HostAndLog -BasePath $archiveRoot -Level "INFO" -Message "No files to move for option $Option"
+            try { Write-UnifiedArchiveJson -DateFolder $archiveRoot } catch {}
+            continue
+        }
+
+        # Prepare target folders - only create those needed
+        if ($ArchiveMode -eq 'new') {
+            $mediaFolder = Join-Path $archiveRoot 'Medias'
+            $stillsFolder = Join-Path $archiveRoot 'Stills'
+            $rawFolder   = Join-Path $stillsFolder 'RAW_arw'
+            $soHifFolder = Join-Path $stillsFolder 'SO_hif'
+            $soJpgFolder = Join-Path $stillsFolder 'SO_jpg'
+            if ($toMoveMedias.Count -gt 0 -and -not (Test-Path -LiteralPath $mediaFolder)) { if ($Apply) { New-Item -ItemType Directory -Path $mediaFolder -Force | Out-Null } }
+            if (($toMoveRaws.Count + $toMoveSoHif.Count + $toMoveSoJpg.Count) -gt 0 -and -not (Test-Path -LiteralPath $stillsFolder)) { if ($Apply) { New-Item -ItemType Directory -Path $stillsFolder -Force | Out-Null } }
+            if ($toMoveRaws.Count -gt 0 -and -not (Test-Path -LiteralPath $rawFolder)) { if ($Apply) { New-Item -ItemType Directory -Path $rawFolder -Force | Out-Null } }
+            if ($toMoveSoHif.Count -gt 0 -and -not (Test-Path -LiteralPath $soHifFolder)) { if ($Apply) { New-Item -ItemType Directory -Path $soHifFolder -Force | Out-Null } }
+            if ($toMoveSoJpg.Count -gt 0 -and -not (Test-Path -LiteralPath $soJpgFolder)) { if ($Apply) { New-Item -ItemType Directory -Path $soJpgFolder -Force | Out-Null } }
+        } else {
+            $mediaFolder = Join-Path $archiveRoot 'Medias'
+            $rawFolder   = Join-Path $archiveRoot 'RAW_arw'
+            $soHifFolder = Join-Path $archiveRoot 'SO_hif'
+            $soJpgFolder = Join-Path $archiveRoot 'SO_jpg'
+            if ($toMoveMedias.Count -gt 0 -and -not (Test-Path -LiteralPath $mediaFolder)) { if ($Apply) { New-Item -ItemType Directory -Path $mediaFolder -Force | Out-Null } }
+            if ($toMoveRaws.Count -gt 0 -and -not (Test-Path -LiteralPath $rawFolder)) { if ($Apply) { New-Item -ItemType Directory -Path $rawFolder -Force | Out-Null } }
+            if ($toMoveSoHif.Count -gt 0 -and -not (Test-Path -LiteralPath $soHifFolder)) { if ($Apply) { New-Item -ItemType Directory -Path $soHifFolder -Force | Out-Null } }
+            if ($toMoveSoJpg.Count -gt 0 -and -not (Test-Path -LiteralPath $soJpgFolder)) { if ($Apply) { New-Item -ItemType Directory -Path $soJpgFolder -Force | Out-Null } }
+        }
+
+        $moveLog = @(); $movedCount = 0; $skippedCount = 0; $failedCount = 0; $totalBytes = 0
+        $startTime = Get-Date
+
+        # Process Medias
+        foreach ($file in $toMoveMedias) {
+            $destPath = Join-Path $mediaFolder $file.Name
+            $origChecksum = Get-FileChecksum -Path $file.FullName
+            if (Test-Path -LiteralPath $destPath) {
+                $skippedCount++
+                $destChecksum = Get-FileChecksum -Path $destPath
+                $moveLog += @{ Original = $file.FullName; Dest = $destPath; Size = $file.Length; Type = 'Media'; Timestamp = (Get-Date).ToString('o'); Status = 'Conflict'; OrigChecksum = $origChecksum; DestChecksum = $destChecksum }
+                continue
+            }
+            if ($Apply) {
+                try { Move-Item -LiteralPath $file.FullName -Destination $destPath; $movedCount++; $totalBytes += $file.Length; $moveLog += @{ Original = $file.FullName; Dest = $destPath; Size = $file.Length; Type = 'Media'; Timestamp = (Get-Date).ToString('o'); Status = 'Moved'; OrigChecksum = $origChecksum } } catch { $failedCount++; $moveLog += @{ Original = $file.FullName; Dest = $destPath; Size = $file.Length; Type = 'Media'; Timestamp = (Get-Date).ToString('o'); Status = 'Failed'; Error = $_.Exception.Message; OrigChecksum = $origChecksum } }
+            } else {
+                $moveLog += @{ Original = $file.FullName; Dest = $destPath; Size = $file.Length; Type = 'Media'; Timestamp = (Get-Date).ToString('o'); Status = 'Planned'; OrigChecksum = $origChecksum }
+            }
+        }
+
+        # Process Raws
+        foreach ($file in $toMoveRaws) {
+            $destPath = Join-Path $rawFolder $file.Name
+            $origChecksum = Get-FileChecksum -Path $file.FullName
+            if (Test-Path -LiteralPath $destPath) {
+                $skippedCount++
+                $destChecksum = Get-FileChecksum -Path $destPath
+                $moveLog += @{ Original = $file.FullName; Dest = $destPath; Size = $file.Length; Type = 'RAW'; Timestamp = (Get-Date).ToString('o'); Status = 'Conflict'; OrigChecksum = $origChecksum; DestChecksum = $destChecksum }
+                continue
+            }
+            if ($Apply) {
+                try { Move-Item -LiteralPath $file.FullName -Destination $destPath; $movedCount++; $totalBytes += $file.Length; $moveLog += @{ Original = $file.FullName; Dest = $destPath; Size = $file.Length; Type = 'RAW'; Timestamp = (Get-Date).ToString('o'); Status = 'Moved'; OrigChecksum = $origChecksum } } catch { $failedCount++; $moveLog += @{ Original = $file.FullName; Dest = $destPath; Size = $file.Length; Type = 'RAW'; Timestamp = (Get-Date).ToString('o'); Status = 'Failed'; Error = $_.Exception.Message; OrigChecksum = $origChecksum } }
+            } else {
+                $moveLog += @{ Original = $file.FullName; Dest = $destPath; Size = $file.Length; Type = 'RAW'; Timestamp = (Get-Date).ToString('o'); Status = 'Planned'; OrigChecksum = $origChecksum }
+            }
+        }
+
+        # Process SoHif
+        foreach ($file in $toMoveSoHif) {
+            $destPath = Join-Path $soHifFolder $file.Name
+            $origChecksum = Get-FileChecksum -Path $file.FullName
+            if (Test-Path -LiteralPath $destPath) {
+                $skippedCount++
+                $destChecksum = Get-FileChecksum -Path $destPath
+                $moveLog += @{ Original = $file.FullName; Dest = $destPath; Size = $file.Length; Type = 'HIF'; Timestamp = (Get-Date).ToString('o'); Status = 'Conflict'; OrigChecksum = $origChecksum; DestChecksum = $destChecksum }
+                continue
+            }
+            if ($Apply) {
+                try { Move-Item -LiteralPath $file.FullName -Destination $destPath; $movedCount++; $totalBytes += $file.Length; $moveLog += @{ Original = $file.FullName; Dest = $destPath; Size = $file.Length; Type = 'HIF'; Timestamp = (Get-Date).ToString('o'); Status = 'Moved'; OrigChecksum = $origChecksum } } catch { $failedCount++; $moveLog += @{ Original = $file.FullName; Dest = $destPath; Size = $file.Length; Type = 'HIF'; Timestamp = (Get-Date).ToString('o'); Status = 'Failed'; Error = $_.Exception.Message; OrigChecksum = $origChecksum } }
+            } else {
+                $moveLog += @{ Original = $file.FullName; Dest = $destPath; Size = $file.Length; Type = 'HIF'; Timestamp = (Get-Date).ToString('o'); Status = 'Planned'; OrigChecksum = $origChecksum }
+            }
+        }
+
+        # Process SoJpg
+        foreach ($file in $toMoveSoJpg) {
+            $destPath = Join-Path $soJpgFolder $file.Name
+            $origChecksum = Get-FileChecksum -Path $file.FullName
+            if (Test-Path -LiteralPath $destPath) {
+                $skippedCount++
+                $destChecksum = Get-FileChecksum -Path $destPath
+                $moveLog += @{ Original = $file.FullName; Dest = $destPath; Size = $file.Length; Type = 'JPG'; Timestamp = (Get-Date).ToString('o'); Status = 'Conflict'; OrigChecksum = $origChecksum; DestChecksum = $destChecksum }
+                continue
+            }
+            if ($Apply) {
+                try { Move-Item -LiteralPath $file.FullName -Destination $destPath; $movedCount++; $totalBytes += $file.Length; $moveLog += @{ Original = $file.FullName; Dest = $destPath; Size = $file.Length; Type = 'JPG'; Timestamp = (Get-Date).ToString('o'); Status = 'Moved'; OrigChecksum = $origChecksum } } catch { $failedCount++; $moveLog += @{ Original = $file.FullName; Dest = $destPath; Size = $file.Length; Type = 'JPG'; Timestamp = (Get-Date).ToString('o'); Status = 'Failed'; Error = $_.Exception.Message; OrigChecksum = $origChecksum } }
+            } else {
+                $moveLog += @{ Original = $file.FullName; Dest = $destPath; Size = $file.Length; Type = 'JPG'; Timestamp = (Get-Date).ToString('o'); Status = 'Planned'; OrigChecksum = $origChecksum }
+            }
+        }
+
+        # write logs
+        $archiveMoveLog  = Join-Path $archiveRoot 'archive_move_log.json'
+        $archiveSession  = Join-Path $archiveRoot 'archive_session.json'
+        $archiveSummary  = Join-Path $archiveRoot 'archive_summary.txt'
+        $moveLog | ConvertTo-Json -Depth 6 | Out-File -FilePath $archiveMoveLog -Encoding UTF8
+        $endTime = Get-Date; $elapsed = $endTime - $startTime; $bytesPerSec = if ($elapsed.TotalSeconds -gt 0) {[math]::Round($totalBytes/$elapsed.TotalSeconds,0)} else {0}
+        $session = @{ SessionId = ([guid]::NewGuid()).Guid; Option = $Option; Start = $startTime.ToString('o'); End = $endTime.ToString('o'); ElapsedSeconds = [math]::Round($elapsed.TotalSeconds,2); Moved = $movedCount; Skipped = $skippedCount; Failed = $failedCount; TotalBytes = $totalBytes; BytesPerSec = $bytesPerSec }
+        $session | ConvertTo-Json -Depth 6 | Out-File -FilePath $archiveSession -Encoding UTF8
+        $summary = @(); $summary += '------------------------------------------------------------------------------'; $summary += "Archive summary for: $archiveRoot"; $summary += "Start : $((Get-Date).ToString())"; $summary += "End   : $($endTime.ToString())"; $summary += "Elapsed: $($elapsed)"; $summary += "Moved : $movedCount"; $summary += "Skipped(conflicts): $skippedCount"; $summary += "Failed: $failedCount"; $summary += "Bytes moved: $totalBytes"; $summary += "Speed (bytes/sec): $bytesPerSec"; $summary += "SessionId: $($session.SessionId)"; $summary += '------------------------------------------------------------------------------'
+        $summary | Out-File -FilePath $archiveSummary -Encoding UTF8; $summary | ForEach-Object { Write-Host $_ }
+        try { Write-UnifiedArchiveJson -DateFolder $archiveRoot } catch {}
+    }
 }
 
 # Non-interactive auto-archive helper: perform archive according to numeric option (1-6).
@@ -655,7 +907,7 @@ function Migrate-OldArtifacts {
 function Write-UnifiedArchiveJson {
     param([string]$DateFolder)
     try {
-        if (-not (Test-Path -LiteralPath $DateFolder)) { return }
+           if (-not $DateFolder -or -not (Test-Path -LiteralPath $DateFolder)) { return }
         $moveLogPath = Join-Path $DateFolder 'archive_move_log.json'
         $summaryPath = Join-Path $DateFolder 'archive_summary.txt'
         $listPath    = Join-Path $DateFolder 'archive_list_full.txt'
@@ -689,7 +941,7 @@ function Write-UnifiedArchiveJson {
         $result | ConvertTo-Json -Depth 6 | Out-File -FilePath $outPath -Encoding UTF8
         Write-HostAndLog -BasePath $DateFolder -Level "INFO" -Message "Unified archive JSON written: $outPath"
     } catch {
-        Write-HostAndLog -BasePath $DateFolder -Level "ERROR" -Message "Write-UnifiedArchiveJson failed: $($_.Exception.Message)"
+        if ($DateFolder) { Write-HostAndLog -BasePath $DateFolder -Level "ERROR" -Message "Write-UnifiedArchiveJson failed: $($_.Exception.Message)" } else { Write-Host "ERROR in Write-UnifiedArchiveJson: $($_.Exception.Message)" }
     }
 }
 
@@ -943,23 +1195,76 @@ function Sync-RawAndSo {
         }
         $selectedFolders = Select-DateFoldersRange -Folders $dateFolders -BasePath $ScriptPath
         Write-Log -BasePath $ScriptPath -Level "INFO" -Message ("Selected folders: " + (($selectedFolders | ForEach-Object Name) -join ', '))
-        # Invoke auto-archive for each selected date folder
+        
+        # Aggregated multi-folder archive: single-scan, single-summary, single-batch execution
         try {
-            $archMode = Show-ArchiveModes
-            $continueAfterArchive = $true
-            foreach ($df in $selectedFolders) {
-                Write-Log -BasePath $ScriptPath -Level "INFO" -Message "Auto-archiving: '$($df.FullName)'"
-                $cont = Invoke-AutoArchive -DateFolder $df.FullName -ListLimit 100 -ArchiveMode $archMode
-                try { Write-UnifiedArchiveJson -DateFolder $df.FullName } catch {}
-                if (-not $cont) { $continueAfterArchive = $false }
+            $agg = Aggregate-ArchiveCandidates -Folders $selectedFolders
+            while ($true) {
+                Show-AggregatedSummary -Agg $agg
+                Write-Host ("`nOptions:`n1) (try)Archive All`n2) Only Medias`n3) Only RAWs`n4) Only SOs`n5) Medias+RAWs`n6) RAWs+SOs`n7) Do not run")
+                $choice = Read-Host "Choose option number for the WHOLE batch (1-7), or type 'A' to reselect folders"
+                if ($choice -ieq 'A') {
+                    Write-Log -BasePath $ScriptPath -Level "INFO" -Message "User requested re-selection of folders."
+                    $selectedFolders = Select-DateFoldersRange -Folders $dateFolders -BasePath $ScriptPath
+                    $agg = Aggregate-ArchiveCandidates -Folders $selectedFolders
+                    continue
+                }
+                if ($choice -notmatch '^[1-7]$') { Write-Host "Invalid choice. Please enter 1-7 or 'A'."; continue }
+
+                try {
+                    $apply = $false
+                    $applyConfirm = Read-Host "Type APPLY to perform REAL moves, or press Enter for dry-run (safe, no files moved)"
+                    try { 
+                        if (-not [string]::IsNullOrEmpty($applyConfirm)) {
+                            $apply = ($applyConfirm -match '(?i)^APPLY$')
+                        }
+                    } catch { $apply = $false }
+                    
+                    # Final confirmation before real move
+                    if ($apply) {
+                        $totalFiles = ($agg | ForEach-Object { $_.Medias.Count + $_.Raws.Count + $_.SoHif.Count + $_.SoJpg.Count } | Measure-Object -Sum).Sum
+                        Write-Host "WARNING: You are about to PERMANENTLY move $totalFiles files across $($agg.Count) folder(s)!" -ForegroundColor Yellow
+                        $finalConfirm = Read-Host "Type YES to confirm real archive, or press Enter to cancel"
+                        $apply = ($finalConfirm -match '(?i)^YES$')
+                    }
+                    
+                    if ($apply) { 
+                        Write-Host "APPLYING real archive with option: $choice" -ForegroundColor Cyan
+                    } else { 
+                        Write-Host "Running dry-run (safe, no files moved) with option: $choice" -ForegroundColor Green
+                    }
+                    try {
+                        if ($apply) { Batch-PerformArchive -Agg $agg -Option ([int]$choice) -ArchiveMode 'new' -Apply } else { Batch-PerformArchive -Agg $agg -Option ([int]$choice) -ArchiveMode 'new' }
+                    } catch {
+                        Write-Host "ERROR: Batch-PerformArchive failed: $($_.Exception.Message)" -ForegroundColor Red
+                        try { Write-Host $_.Exception.StackTrace } catch {}
+                        $logBase = if ($ScriptPath -and -not [string]::IsNullOrWhiteSpace($ScriptPath)) { $ScriptPath } else { (Get-Location).ProviderPath }
+                        try { Write-Log -BasePath $logBase -Level "ERROR" -Message "Batch-PerformArchive exception: $($_.Exception.Message)" } catch { Write-Host "(failed to log error)" }
+                        SafeExitWithPause "Batch-PerformArchive failed. Press Enter to exit."
+                        return
+                    }
+                } catch {
+                    Write-Host "WARNING: unexpected input error; defaulting to dry-run." -ForegroundColor Yellow
+                    $apply = $false
+                    try { Batch-PerformArchive -Agg $agg -Option ([int]$choice) -ArchiveMode 'new' } catch { Write-Host "ERROR: Batch execution failed: $($_.Exception.Message)" -ForegroundColor Red }
+                }
+
+                if (-not $apply) {
+                    Write-Host "[OK] Dry-run complete. No files were moved. You can run again with APPLY when ready." -ForegroundColor Green
+                    $cont = Prompt-ContinueToSync -PromptMessage "Press 'C' then Enter to continue to sync, or press Enter to exit"
+                    if (-not $cont) { SafeExitWithPause "Press Enter to exit."; return }
+                } else {
+                    Write-Host "[OK] Archive applied successfully. Files have been moved." -ForegroundColor Green
+                    $cont = Prompt-ContinueToSync -PromptMessage "Press 'C' then Enter to continue to sync, or press Enter to exit"
+                    if (-not $cont) { SafeExitWithPause "Press Enter to exit."; return }
+                }
+
+                # Set dateFolder to last selected folder for sync phase
+                $dateFolder = $selectedFolders[-1]
+                break
             }
         } catch {
             Write-Log -BasePath $ScriptPath -Level "ERROR" -Message "AutoArchive failed: $($_.Exception.Message)"
-            $continueAfterArchive = $true
-        }
-        if (-not $continueAfterArchive) {
-            Write-Log -BasePath $ScriptPath -Level "INFO" -Message "User chose to end after archive."
-            return
         }
     }
 
@@ -988,29 +1293,41 @@ function Sync-RawAndSo {
         }
     }
 
-    # Determine Stills folder
-    if ($ctx.Mode -eq 'Stills') {
-        $stillsFolder = $ctx.StillsFolder
-    } else {
-        $sf = Join-Path $dateFolder.FullName "Stills"
-        if (Test-Path -LiteralPath $sf) { $stillsFolder = $sf } else { $stillsFolder = $dateFolder.FullName }
-    }
-    Write-Log -BasePath $ScriptPath -Level "INFO" -Message "Stills folder: '$stillsFolder'"
+    # Post-archive: determine Stills/RAW/SO safely. Wrap in try/catch to avoid unhandled exceptions
+    try {
+        if (-not $dateFolder -or -not $dateFolder.FullName) {
+            try { Write-Log -BasePath $ScriptPath -Level "ERROR" -Message "Post-archive: dateFolder is null or invalid, aborting post-archive processing." } catch {}
+            return
+        }
 
-    # Let user choose matching strategy before folder detection
-    Show-MatchOptions
+        # Determine Stills folder
+        if ($ctx.Mode -eq 'Stills') {
+            $stillsFolder = $ctx.StillsFolder
+        } else {
+            $sf = Join-Path $dateFolder.FullName "Stills"
+            if ($sf -and (Test-Path -LiteralPath $sf)) { $stillsFolder = $sf } else { $stillsFolder = $dateFolder.FullName }
+        }
+        try { Write-Log -BasePath $ScriptPath -Level "INFO" -Message "Stills folder: '$stillsFolder'" } catch {}
 
-    # Detect RAW/SO folders
-    if ($ctx.Mode -eq 'Stills') {
-        $rawSo = Find-RawSoFolders -BasePath $stillsFolder -SearchSameLevel:$true
-    } else {
-        $rawSo = Find-RawSoFolders -BasePath $dateFolder.FullName -SearchSameLevel:$false
-    }
+        # Let user choose matching strategy before folder detection
+        Show-MatchOptions
 
-    if (-not $rawSo.RawFolder -or -not $rawSo.SoFolder) {
-        Write-Host "RAW/SO folders not found."
-        Write-Log -BasePath $ScriptPath -Level "ERROR" -Message "RAW/SO not found; Stills='$stillsFolder'"
-        Invoke-TestMode -BasePath $ScriptPath
+        # Detect RAW/SO folders
+        if ($ctx.Mode -eq 'Stills') {
+            $rawSo = Find-RawSoFolders -BasePath $stillsFolder -SearchSameLevel:$true
+        } else {
+            $rawSo = Find-RawSoFolders -BasePath $dateFolder.FullName -SearchSameLevel:$false
+        }
+
+        if (-not $rawSo.RawFolder -or -not $rawSo.SoFolder) {
+            Write-Host "RAW/SO folders not found."
+            try { Write-Log -BasePath $ScriptPath -Level "ERROR" -Message "RAW/SO not found; Stills='$stillsFolder'" } catch {}
+            Invoke-TestMode -BasePath $ScriptPath
+        }
+    } catch {
+        # Log and bail out gracefully rather than allowing an unhandled exception
+        try { Write-Log -BasePath $ScriptPath -Level "ERROR" -Message "Post-archive processing failed: $($_.Exception.Message)" } catch {}
+        SafeExitWithPause "An error occurred after archive. Press Enter to continue..."
         return
     }
 
@@ -1138,7 +1455,9 @@ try {
 
 catch {
     Write-Host "ERROR (unhandled): $($_.Exception.Message)"
+    try { Write-Host $_.Exception.StackTrace } catch {}
     Write-Log -BasePath $ScriptPath -Level "ERROR" -Message "Unhandled exception: $($_.Exception.Message)"
     try { Start-Process notepad.exe (Join-Path $ScriptPath "latest.log") } catch {}
+    try { if ($Error -and $Error.Count -gt 0) { Write-Host "Invocation: $($Error[0].InvocationInfo.ScriptName) : $($Error[0].InvocationInfo.ScriptLineNumber)" } } catch {}
     SafeExitWithPause "Unhandled error occurred. Press Enter to exit."
-      }
+}
